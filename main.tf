@@ -56,6 +56,77 @@ resource "aws_security_group" "searchhead" {
     }
 }
 
+#template for configuration
+
+resource "template_file" "web_conf" {
+    template    = "${file("${path.module}/web_conf.tpl")}"
+    vars     {
+        httpport        = "${var.httpport}"
+        mgmtHostPort    = "${var.mgmtHostPort}"
+    }
+}
+
+
+resource "template_file" "server_conf_master" {
+    template    = "${file("${path.module}/server_conf_master.tpl")}"
+    vars     {
+        replication_factor  = "${var.replication_factor}"
+        search_factor       = "${var.search_factor}"
+        pass4SymmKey        = "${var.pass4SymmKey}"
+    }
+}
+
+resource "template_file" "server_conf_indexer" {
+    template    = "${file("${path.module}/server_conf_indexer.tpl")}"
+    vars    {
+        mgmtHostPort        = "${var.mgmtHostPort}"
+        master_ip           = "${aws_instance.master.private_ip}"
+        pass4SymmKey        = "${var.pass4SymmKey}"
+        replication_port    = "${var.replication_port}"
+    }
+}
+
+resource "template_file" "server_conf_searchhead" {
+    template    = "${file("${path.module}/server_conf_searchhead.tpl")}"
+    vars    {
+        mgmtHostPort        = "${var.mgmtHostPort}"
+        master_ip           = "${aws_instance.master.private_ip}"
+        pass4SymmKey        = "${var.pass4SymmKey}"
+    }
+}
+
+
+##templating for user data
+resource "template_file" "user_data_master" {
+    template    = "${file("${path.module}/user_data.tpl")}"
+    vars    {
+        server_conf_content             = "${template_file.server_conf_master.rendered}"
+        web_conf_content                = "${template_file.web_conf.rendered}"
+        role                            = "master"
+    }
+}
+
+
+resource "template_file" "user_data_indexer" {
+    template    = "${file("${path.module}/user_data.tpl")}"
+    vars    {
+        server_conf_content             = "${template_file.server_conf_indexer.rendered}"
+        web_conf_content                = "${template_file.web_conf.rendered}"
+        role                            = "indexer"
+    }
+}
+
+resource "template_file" "user_data_searchhead" {
+    template    = "${file("${path.module}/user_data.tpl")}"
+    vars    {
+        server_conf_content             = "${template_file.server_conf_searchhead.rendered}"
+        web_conf_content                = "${template_file.web_conf.rendered}"
+        role                            = "searchhead"
+    }
+}
+
+
+
 #master
 
 resource "aws_instance" "master" {
@@ -74,32 +145,38 @@ resource "aws_instance" "master" {
 }
 
 
+##index cluster autoscaling
 
-
-#Indexers
-
-
-resource "aws_instance" "indexer" {
-    count                       = "${var.count_indexer}"
+resource "aws_launch_configuration" "indexer_base" {
+    name = "indexer_base"
     connection {
         user = "${var.instance_user}"
     }
-    tags {
-        Name = "splunk_indexer"
-    }
-    ami                         = "${var.ami}"
+    image_id                    = "${var.ami}"
     instance_type               = "${var.instance_type_indexer}"
     key_name                    = "${var.key_name}"
-    subnet_id                   = "${element(split(",", var.subnets), count.index)}"
-    user_data                   = "${file("slave.sh")}"
-    vpc_security_group_ids      = ["${aws_security_group.all.id}"]
+    user_data                   = "${template_file.user_data_indexer.rendered}"
+    security_groups             = ["${aws_security_group.all.id}"]
 }
 
 
-
+resource "aws_autoscaling_group" "indexer" {
+    name = "asg_splunk_indexer"
+    availability_zones         = ["${split(",", var.availability_zones)}"]
+    vpc_zone_identifier        = ["${split(",", var.subnets)}"]
+    min_size                   = "${var.asg_peer_min}"
+    max_size                   = "${var.asg_peer_max}"
+    desired_capacity           = "${var.asg_peer_desired}"
+    launch_configuration       = "${aws_launch_configuration.indexer_base.name}"
+    tag {
+        key                 = "Name"
+        value               = "splunk_indexer"
+        propagate_at_launch = true
+    }
+}
 
 ###################### searchhead autoscaling part ######################
-resource "aws_launch_configuration" "searchhead" {
+resource "aws_launch_configuration" "searchhead_base" {
     name = "lc_splunk_searchhead"
     connection {
         user = "${var.instance_user}"
@@ -107,20 +184,18 @@ resource "aws_launch_configuration" "searchhead" {
     image_id                    = "${var.ami}"
     instance_type               = "${var.instance_type_searchhead}"
     key_name                    = "${var.key_name}"
-    user_data                   = "${file("searchhead.sh")}"
+    user_data                   = "${template_file.user_data_searchhead.rendered}"
     security_groups             = ["${aws_security_group.all.id}", "${aws_security_group.searchhead.id}"]
 }
 
 resource "aws_autoscaling_group" "searchhead" {
     name = "asg_splunk_searchhead"
-    availability_zones         = ["${split(",", var.availability_zones)}"]
-    vpc_zone_identifier        = ["${split(",", var.subnets)}"]
+    availability_zones         = ["${var.site1_az}"]
+    vpc_zone_identifier        = ["${var.site1_subnet}"]
     min_size                   = "${var.asg_searchhead_min}"
     max_size                   = "${var.asg_searchhead_max}"
     desired_capacity           = "${var.asg_searchhead_desired}"
-    health_check_grace_period  = 300
-    health_check_type          = "EC2"
-    launch_configuration       = "${aws_launch_configuration.searchhead.name}"
+    launch_configuration       = "${aws_launch_configuration.searchhead_base.name}"
     tag {
         key                 = "Name"
         value               = "splunk_searchhead"
